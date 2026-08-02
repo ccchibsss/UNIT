@@ -3,11 +3,11 @@ Marketplace Manager (FBS Edition) — Монолитное приложение 
 Адаптация: Автозапчасти.
 Модель: FBS (Fulfillment by Seller). WB / Ozon / Яндекс Маркет / СберМегаМаркет.
 
-Улучшения:
-  1. Кэширование (@st.cache_data) для мгновенной работы с 500 000+ SKU.
-  2. Безопасный парсинг JSON от LLM (очистка от markdown).
-  3. Доменная логика автозапчастей: объемный вес, коэффициент возвратов (VIN-несовместимость).
-  4. Векторизованная генерация данных.
+Исправления v4.1:
+  1. Удален np.core.defchararray (несовместим с NumPy 2.0+).
+  2. Усилен Regex для очистки markdown-ответов LLM.
+  3. Исправлена обработка NaN в правилах и агрегации P&L.
+  4. Оптимизирована генерация строк (истинная векторизация массивов + zip).
 """
 from __future__ import annotations
 import json, warnings, re
@@ -15,7 +15,6 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import requests
 import streamlit as st
 
@@ -23,7 +22,6 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="FBS AutoParts Manager", page_icon="🚗", layout="wide", initial_sidebar_state="expanded")
 
 MARKETPLACES = ["Wildberries", "Ozon", "Яндекс Маркет", "СберМегаМаркет"]
-# Специфичные категории для автозапчастей
 CATEGORIES = ["Двигатель и выхлоп", "Подвеска и рулевое", "Тормозная система", "Фильтры и масла", "Кузовные детали", "Электрика", "Шины и диски"]
 STATUSES = ["Активен", "Приостановлен", "Нет в наличии"]
 STATUS_ICON = {"Активен": "🟢", "Приостановлен": "🟡", "Нет в наличии": "🔴"}
@@ -34,7 +32,6 @@ SOURCE_LABEL = {"api": "API маркетплейса", "deepseek": "DeepSeek", "
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-chat"
 
-# Бренды и типы деталей для генерации
 AUTO_PARTS_TYPES = {
     "Двигатель и выхлоп": ["Свечи зажигания", "Прокладка ГБЦ", "Глушитель", "Ремень ГРМ", "Масляный насос"],
     "Подвеска и рулевое": ["Амортизатор", "Шаровая опора", "Сайлентблок", "Рулевая тяга", "Ступица"],
@@ -42,15 +39,13 @@ AUTO_PARTS_TYPES = {
     "Фильтры и масла": ["Масляный фильтр", "Воздушный фильтр", "Салонный фильтр", "Моторное масло 5W-40", "Антифриз"],
     "Кузовные детали": ["Бампер передний", "Крыло", "Капот", "Зеркало боковое", "Фара"],
     "Электрика": ["Аккумулятор", "Генератор", "Стартер", "Датчик ABS", "Лампа H7"],
-    "Шины и диски": ["Шина летняя 205/55 R16", "Диск литой 16'", "Колпак", "Цепи противоскольжения", "Домкрат"],
+    "Шины и диски": ["Шина летняя 205/55 R16", "Диск литой 16", "Колпак", "Цепи противоскольжения", "Домкрат"],
 }
 BRANDS = ["Bosch", "KYB", "Sachs", "Mann-Filter", "NGK", "Febi", "Lemforder", "Brembo", "Denso", "Оригинал"]
 
-# Базовые тарифы (гипотеза, требует проверки по реальным API)
-# Автозапчасти: комиссия средняя, но логистика сильно зависит от веса/габаритов
 _CAT_COMMISSION = {"Двигатель и выхлоп": 12, "Подвеска и рулевое": 13, "Тормозная система": 13, "Фильтры и масла": 10, "Кузовные детали": 15, "Электрика": 12, "Шины и диски": 9}
 _MP_COMM_MULT = {"Wildberries": 1.0, "Ozon": 0.95, "Яндекс Маркет": 0.90, "СберМегаМаркет": 0.92}
-_MP_LOGISTICS_BASE = {"Wildberries": 60, "Ozon": 50, "Яндекс Маркет": 55, "СберМегаМаркет": 58} # Базовая стоимость, будет умножена на вес
+_MP_LOGISTICS_BASE = {"Wildberries": 60, "Ozon": 50, "Яндекс Маркет": 55, "СберМегаМаркет": 58}
 _MP_PACKAGING = {"Wildberries": 40, "Ozon": 35, "Яндекс Маркет": 38, "СберМегаМаркет": 40}
 _MP_STORAGE = {"Wildberries": 5, "Ozon": 4, "Яндекс Маркет": 4, "СберМегаМаркет": 5}
 _MP_SLA = {"Wildberries": 2, "Ozon": 3, "Яндекс Маркет": 3, "СберМегаМаркет": 5}
@@ -69,10 +64,12 @@ def src_badge_html(source):
     return f'<span class="src-badge" style="background:{color}22;color:{color}">{SOURCE_LABEL.get(source, source)}</span>'
 
 def fmt_rub(v):
-    try: return f"{int(round(float(v))):,} ₽".replace(",", " ")
-    except Exception: return "—"
+    try: 
+        return f"{int(round(float(v))):,} ₽".replace(",", " ")
+    except (ValueError, TypeError): 
+        return "—"
 
-# ----------------------------- ТАРИФЫ (гибрид + кэш) -----------------------------
+# ----------------------------- ТАРИФЫ -----------------------------
 @st.cache_data(ttl=3600)
 def default_tariff_rows():
     rows = []
@@ -80,16 +77,10 @@ def default_tariff_rows():
         for cat in CATEGORIES:
             rows.append({"marketplace": mp, "category": cat,
                          "commission_pct": round(_CAT_COMMISSION[cat]*_MP_COMM_MULT[mp], 2),
-                         "logistics_per_kg": float(_MP_LOGISTICS_BASE[mp]), # Изменено на за кг
+                         "logistics_per_kg": float(_MP_LOGISTICS_BASE[mp]),
                          "packaging_cost": float(_MP_PACKAGING[mp]),
                          "storage_cost_per_unit": float(_MP_STORAGE[mp]), "sla_days": int(_MP_SLA[mp]), "source": "default"})
     return pd.DataFrame(rows)
-
-# Функции API оставлены схематичными, так как требуют реальных ключей. 
-# Добавлена безопасная обработка ошибок.
-def _try_api_stub(mp, keys):
-    # Заглушка для демонстрации структуры. В продакшене здесь реальные запросы.
-    raise NotImplementedError("API запросы требуют валидных ключей и актуальных эндпоинтов.")
 
 def fetch_deepseek_tariffs(api_key, marketplace):
     sysmsg = "You are an e-commerce tariff analyst for Russian auto parts marketplaces (FBS). Return ONLY valid JSON."
@@ -103,9 +94,9 @@ def fetch_deepseek_tariffs(api_key, marketplace):
                                 "response_format": {"type": "json_object"}}, timeout=40)
         r.raise_for_status()
         raw_content = r.json()["choices"][0]["message"]["content"]
-        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: очистка от markdown-оберток
-        clean_content = re.sub(r'^```json\s*', '', raw_content, flags=re.MULTILINE)
-        clean_content = re.sub(r'\s*```$', '', clean_content, flags=re.MULTILINE).strip()
+        
+        # ИСПРАВЛЕНИЕ: Надежная очистка от markdown-оберток с учетом отступов и переносов строк
+        clean_content = re.sub(r'^\s*```(?:json)?\s*|\s*```\s*$', '', raw_content, flags=re.IGNORECASE | re.DOTALL).strip()
         
         data = json.loads(clean_content)
         lst = data.get("tariffs", [])
@@ -145,17 +136,14 @@ def resolve_tariffs(keys, use_api=True, use_deepseek=True):
         
     return pd.DataFrame(list(tmap.values())), sources, notes
 
-# ----------------------------- ДАННЫЕ (500 000+) С КЭШИРОВАНИЕМ -----------------------------
+# ----------------------------- ДАННЫЕ -----------------------------
 @st.cache_data(ttl=7200)
 def generate_auto_parts_products(n, seed=42):
     rng = np.random.default_rng(seed); n = int(n)
     mp = rng.choice(MARKETPLACES, size=n); cat = rng.choice(CATEGORIES, size=n)
     
-    # Цены и себестоимость для автозапчастей (более широкий разброс)
     price = np.clip((200 + np.power(rng.random(n), 1.8)*35000), 200, 50000).round().astype(np.int64)
     cost = (price*rng.uniform(0.35, 0.65, n)).round().astype(np.int64)
-    
-    # Габариты и вес (критично для автозапчастей)
     weight_kg = np.clip(rng.exponential(scale=2.5, size=n), 0.1, 50.0).round(2)
     
     total_stock = (np.power(rng.random(n), 1.4)*800).astype(np.int64)
@@ -166,19 +154,18 @@ def generate_auto_parts_products(n, seed=42):
     status = rng.choice(STATUSES, size=n, p=[0.75, 0.15, 0.10])
     created = [datetime.now()-timedelta(days=int(d)) for d in rng.integers(1, 500, size=n)]
     
-    # Спрос и возвраты (в автозапчастях возвраты выше из-за несовместимости)
     avg = np.power(rng.random(n), 2.5)*15 + 0.5
-    std = avg * (0.3 + rng.random(n)*0.4) # Высокая волатильность
+    std = avg * (0.3 + rng.random(n)*0.4)
     sales_30d = np.maximum(0, np.round(avg*30 + rng.standard_normal(n)*std*5)).astype(np.int64)
-    return_rate = np.clip(rng.normal(loc=0.08, scale=0.04, size=n), 0.01, 0.25) # 1% - 25% возвратов
+    return_rate = np.clip(rng.normal(loc=0.08, scale=0.04, size=n), 0.01, 0.25)
     
-    # Векторизованная генерация имен
-    part_names = np.array([rng.choice(AUTO_PARTS_TYPES[str(c)]) for c in cat])
-    part_brands = np.array([rng.choice(BRANDS) for _ in range(n)])
-    oe_numbers = np.array([f"OE-{rng.integers(100000, 999999)}" for _ in range(n)])
-    names = np.core.defchararray.add(np.core.defchararray.add(part_names, " "), np.core.defchararray.add(part_brands, np.core.defchararray.add(" (", np.core.defchararray.add(oe_numbers, ")"))))
+    # ИСПРАВЛЕНИЕ: Векторизованная генерация массивов + безопасная сборка строк (совместимо с NumPy 2.0+)
+    part_names = [rng.choice(AUTO_PARTS_TYPES[str(c)]) for c in cat]
+    part_brands = rng.choice(BRANDS, size=n)
+    oe_numbers = rng.integers(100000, 999999, size=n)
+    names = [f"{p} {b} (OE-{o})" for p, b, o in zip(part_names, part_brands, oe_numbers)]
     
-    sku = np.array([f"SKU-{100000+i}" for i in range(1, n+1)], dtype=object)
+    sku = [f"SKU-{100000+i}" for i in range(1, n+1)]
     
     return pd.DataFrame({"sku": sku, "name": names, "marketplace": mp, "category": cat, "price": price, "cost_price": cost,
         "weight_kg": weight_kg, "total_stock": total_stock, "reserved": reserved, "fbs_available": fbs_available, 
@@ -195,7 +182,7 @@ def generate_trend(n, seed=42):
         rows.append({"date": date.strftime("%Y-%m-%d"), "revenue": rev, "profit": rev*rng.uniform(0.08, 0.18)})
     return pd.DataFrame(rows)
 
-# ----------------------------- ЖИВЫЕ ФОРМУЛЫ С КЭШИРОВАНИЕМ -----------------------------
+# ----------------------------- ЭКОНОМИКА -----------------------------
 @st.cache_data(ttl=3600)
 def compute_economics(df, tariffs):
     m = df.merge(tariffs[["marketplace","category","commission_pct","logistics_per_kg","packaging_cost",
@@ -203,12 +190,9 @@ def compute_economics(df, tariffs):
     for c in ["commission_pct","logistics_per_kg","packaging_cost","storage_cost_per_unit","sla_days"]:
         m[c] = m[c].fillna(0)
     
-    # Логистика считается от веса (упрощенная модель объемного веса)
     m["logistics_cost"] = m["logistics_per_kg"] * m["weight_kg"]
     m["commission_amount"] = m["price"]*m["commission_pct"]/100.0
-    
-    # Прибыль с учетом возвратов (возвратная логистика + потеря части комиссии)
-    m["return_cost"] = m["logistics_cost"] * m["return_rate"] * 0.8 # 80% стоимости логистики теряется при возврате
+    m["return_cost"] = m["logistics_cost"] * m["return_rate"] * 0.8
     m["profit"] = m["price"] - m["cost_price"] - m["commission_amount"] - m["logistics_cost"] - m["packaging_cost"] - m["return_cost"]
     m["margin_pct"] = np.where(m["price"] > 0, m["profit"]/m["price"]*100.0, 0.0)
     
@@ -219,8 +203,16 @@ def compute_economics(df, tariffs):
     return m
 
 def rule_advice(row):
-    margin = float(row.get("margin_pct", 0) or 0); cover = row.get("cover_days"); cv = float(row.get("cv", 0) or 0)
-    ret_rate = float(row.get("return_rate", 0) or 0)
+    margin = float(row.get("margin_pct", 0) or 0)
+    cover = row.get("cover_days")
+    
+    # ИСПРАВЛЕНИЕ: Безопасная обработка NaN для cv и return_rate
+    cv_raw = row.get("cv", 0)
+    cv = float(cv_raw) if not pd.isna(cv_raw) else 0.0
+    
+    ret_raw = row.get("return_rate", 0)
+    ret_rate = float(ret_raw) if not pd.isna(ret_raw) else 0.0
+    
     r = []
     if margin < 0: r.append("Убыток — проверить себестоимость или поднять цену.")
     elif margin < 15: r.append("Низкая маржа для автозапчастей (цель >20%) — пересмотреть закупку.")
@@ -234,7 +226,7 @@ def rule_advice(row):
 # ----------------------------- SESSION STATE -----------------------------
 def init_state():
     ss = st.session_state
-    ss.setdefault("n_products", 50000) # Уменьшено дефолтное для быстрого старта, можно увеличить до 500k
+    ss.setdefault("n_products", 50000)
     ss.setdefault("products_df", generate_auto_parts_products(ss["n_products"]))
     ss.setdefault("trend_df", generate_trend(ss["n_products"]))
     ss.setdefault("tariffs_df", default_tariff_rows())
@@ -244,7 +236,7 @@ def init_state():
 
 init_state()
 
-# ----------------------------- БОКОВОЕ МЕНЮ -----------------------------
+# ----------------------------- UI -----------------------------
 with st.sidebar:
     st.title("🚗 FBS AutoParts"); st.caption("Специфика: вес, возвраты, VIN"); st.markdown("---")
     page = st.radio("Навигация", ["🏠 Дашборд","📦 Товары и остатки","💰 Ценообразование","📊 ABC/XYZ","📈 Отчёты P&L","⚙️ Настройки"], label_visibility="collapsed")
@@ -254,9 +246,8 @@ with st.sidebar:
     st.markdown("---"); st.markdown("**Источники тарифов:**")
     for mp in MARKETPLACES:
         st.markdown(f"{mp}: {src_badge_html(st.session_state.tariff_sources.get(mp,'default'))}", unsafe_allow_html=True)
-    st.markdown("---"); st.caption(f"© {datetime.now().year} FBS AutoParts v4.0")
+    st.markdown("---"); st.caption(f"© {datetime.now().year} FBS AutoParts v4.1")
 
-# Глобальный расчет экономики (теперь кэширован)
 ECO = compute_economics(st.session_state.products_df, st.session_state.tariffs_df)
 df = ECO
 if sel_mp: df = df[df["marketplace"].isin(sel_mp)]
@@ -264,7 +255,6 @@ if sel_cat: df = df[df["category"].isin(sel_cat)]
 critical = st.session_state.critical_stock
 all_default = all(st.session_state.tariff_sources.get(mp) == "default" for mp in MARKETPLACES)
 
-# ----------------------------- ДАШБОРД -----------------------------
 if page == "🏠 Дашборд":
     if all_default:
         st.warning("⚠️ **Демо-тарифы.** Подключите API-ключи или DeepSeek в ⚙️ Настройках для актуальных данных.")
@@ -297,7 +287,6 @@ if page == "🏠 Дашборд":
         fig = px.bar(stock, x="Тип", y="Единиц", color="Тип", color_discrete_sequence=["#28a745","#ffc107"], text="Единиц")
         fig.update_layout(showlegend=False, height=320, margin=dict(t=0,b=0,l=0,r=0)); st.plotly_chart(fig, use_container_width=True)
 
-# ----------------------------- ТОВАРЫ -----------------------------
 elif page == "📦 Товары и остатки":
     st.markdown('<div class="main-header">📦 Управление FBS-остатками (Автозапчасти)</div>', unsafe_allow_html=True)
     st.caption(f"В выборке **{len(df):,} SKU** (всего {len(ECO):,})".replace(",", " "))
@@ -335,13 +324,12 @@ elif page == "📦 Товары и остатки":
         r[3].metric("Безубыточная цена", fmt_rub(be))
         st.caption(f"Источник: {src_badge_html(tr['source'])} · хранение {tr['storage_cost_per_unit']:.0f} ₽/ед/мес", unsafe_allow_html=True)
 
-# ----------------------------- ОСТАЛЬНЫЕ СТРАНИЦЫ (сокращены для фокуса на главном) -----------------------------
 elif page == "💰 Ценообразование":
     st.markdown('<div class="main-header">💰 Умное ценообразование</div>', unsafe_allow_html=True)
     st.info("ℹ️ Учитывайте, что снижение цены на низколиквидные автозапчасти редко дает кратный рост спроса (низкая эластичность).")
     s1,s2,s3 = st.columns(3)
     discount = s1.slider("Скидка, %", 0, 50, 5)
-    elasticity = s2.number_input("Эластичность", value=0.8, step=0.1, min_value=0.0, max_value=5.0) # Дефолт ниже для автозапчастей
+    elasticity = s2.number_input("Эластичность", value=0.8, step=0.1, min_value=0.0, max_value=5.0)
     only_prof = s3.checkbox("Только прибыльные", value=True)
     
     d = df.copy()
@@ -356,8 +344,13 @@ elif page == "💰 Ценообразование":
     
     m = st.columns(3)
     m[0].metric("Текущая прибыль", fmt_rub(old_prof))
-    m[1].metric("Прогноз выручки", fmt_rub(new_rev), delta=f"{(new_rev/old_rev-1)*100:+.1f}%" if old_rev else "0%")
-    m[2].metric("Прогноз прибыли", fmt_rub(new_prof), delta=f"{(new_prof/old_prof-1)*100:+.1f}%" if old_prof else "0%", delta_color="normal" if new_prof>=old_prof else "inverse")
+    
+    # ИСПРАВЛЕНИЕ: Защита от деления на ноль при old_rev == 0
+    rev_delta = f"{(new_rev/old_rev-1)*100:+.1f}%" if old_rev > 0 else "0%"
+    prof_delta = f"{(new_prof/old_prof-1)*100:+.1f}%" if old_prof > 0 else "0%"
+    
+    m[1].metric("Прогноз выручки", fmt_rub(new_rev), delta=rev_delta)
+    m[2].metric("Прогноз прибыли", fmt_rub(new_prof), delta=prof_delta, delta_color="normal" if new_prof>=old_prof else "inverse")
     
     samp = d.assign(new_price=new_price, new_unit=new_unit).nlargest(15, "revenue")
     disp = samp[["sku","name","price","new_price","profit","new_unit","margin_pct","sales_30d"]].copy()
@@ -367,9 +360,9 @@ elif page == "💰 Ценообразование":
 elif page == "📊 ABC/XYZ":
     st.markdown('<div class="main-header">📊 ABC/XYZ анализ</div>', unsafe_allow_html=True)
     a = df.assign(rev=df["price"]*df["sales_30d"]).sort_values("rev", ascending=False).copy()
-    total = float(a["rev"].sum()); a["pct"] = (a["rev"].cumsum()/total*100) if total>0 else 0
+    total = float(a["rev"].sum()); a["pct"] = (a["rev"].cumsum()/total*100) if total>0 else 0.0
     a["abc"] = np.where(a["pct"]<=80,"A",np.where(a["pct"]<=95,"B","C"))
-    a["xyz"] = np.where(a["cv"]<=0.15,"X",np.where(a["cv"]<=0.35,"Y","Z")) # Пороги XYZ расширены для автозапчастей
+    a["xyz"] = np.where(a["cv"]<=0.15,"X",np.where(a["cv"]<=0.35,"Y","Z"))
     L,R = st.columns(2)
     with L:
         cnt = a["abc"].value_counts().reindex(["A","B","C"], fill_value=0)
@@ -389,7 +382,7 @@ elif page == "📈 Отчёты P&L":
     d["_cogs"]=d["cost_price"]*d["sales_30d"]
     d["_comm"]=d["price"]*d["commission_pct"]/100*d["sales_30d"]
     d["_log"]=(d["logistics_per_kg"]*d["weight_kg"])*d["sales_30d"]
-    d["_ret_loss"]=(d["logistics_per_kg"]*d["weight_kg"]*d["return_rate"]*0.8)*d["sales_30d"] # Потери на возвратах
+    d["_ret_loss"]=(d["logistics_per_kg"]*d["weight_kg"]*d["return_rate"]*0.8)*d["sales_30d"]
     d["_pack"]=d["packaging_cost"]*d["sales_30d"]; d["_stor"]=d["storage_monthly"]
     
     pl = d.groupby("marketplace").agg(Выручка=("revenue","sum"), Себестоимость=("_cogs","sum"), Комиссия=("_comm","sum"),
@@ -397,11 +390,17 @@ elif page == "📈 Отчёты P&L":
     pl["Валовая прибыль"] = pl["Выручка"]-pl[["Себестоимость","Комиссия","Логистика","Потери_возвраты","Упаковка","Хранение"]].sum(axis=1)
     pl["Маржа %"] = (pl["Валовая прибыль"]/pl["Выручка"]*100).round(1)
     
-    tot = pl.sum(numeric_only=True); tot["Валовая прибыль"]=tot["Выручка"]-tot[["Себестоимость","Комиссия","Логистика","Потери_возвраты","Упаковка","Хранение"]].sum()
-    tot["Маржа %"] = round(tot["Валовая прибыль"]/tot["Выручка"]*100,1) if tot["Выручка"] else 0; pl.loc["ИТОГО"]=tot
+    tot = pl.sum(numeric_only=True)
+    tot["Валовая прибыль"] = tot["Выручка"] - tot[["Себестоимость","Комиссия","Логистика","Потери_возвраты","Упаковка","Хранение"]].sum()
+    tot["Маржа %"] = round(tot["Валовая прибыль"]/tot["Выручка"]*100, 1) if tot["Выручка"] else 0.0
+    
+    # ИСПРАВЛЕНИЕ: Безопасное добавление строки "ИТОГО" через concat
+    tot.name = "ИТОГО"
+    pl = pd.concat([pl, tot.to_frame().T])
     
     pv = pl.copy()
-    for col in ["Выручка","Себестоимость","Комиссия","Логистика","Потери_возвраты","Упаковка","Хранение","Валовая прибыль"]: pv[col]=pv[col].map(fmt_rub)
+    for col in ["Выручка","Себестоимость","Комиссия","Логистика","Потери_возвраты","Упаковка","Хранение","Валовая прибыль"]: 
+        pv[col] = pv[col].map(fmt_rub)
     st.dataframe(pv, use_container_width=True)
 
 elif page == "⚙️ Настройки":
@@ -421,7 +420,7 @@ elif page == "⚙️ Настройки":
     st.markdown("---"); st.subheader("🔄 Синхронизация тарифов")
     if st.button("🔁 Синхронизировать тарифы (DeepSeek)"):
         with st.spinner("Запрос к DeepSeek..."):
-            tf, src, notes = resolve_tariffs(keys, False, True) # API заглушки отключены для демо
+            tf, src, notes = resolve_tariffs(keys, False, True)
             st.session_state.tariffs_df=tf; st.session_state.tariff_sources=src; st.session_state.tariff_notes=notes
         st.success("Готово."); st.rerun()
     if "tariff_notes" in st.session_state:
@@ -434,7 +433,6 @@ elif page == "⚙️ Настройки":
     if w.button("🔄 Сгенерировать заново"):
         with st.spinner(f"Генерируем {int(new_n):,} SKU…".replace(",", " ")):
             st.session_state.n_products=int(new_n)
-            # Принудительная очистка кэша при смене объема
             generate_auto_parts_products.clear()
             compute_economics.clear()
             st.session_state.products_df=generate_auto_parts_products(int(new_n))
@@ -442,4 +440,4 @@ elif page == "⚙️ Настройки":
         st.success("Готово."); st.rerun()
 
 st.markdown("---")
-st.caption("🚗 FBS AutoParts Manager v4.0 · кэширование · учет веса и возвратов · 500 000+ SKU")
+st.caption("🚗 FBS AutoParts Manager v4.1 · кэширование · учет веса и возвратов · 500 000+ SKU")
