@@ -2,7 +2,8 @@
 Marketplace Manager (FBS Edition) — Монолитное приложение Streamlit.
 Адаптация: Автозапчасти.
 Модель: FBS (Fulfillment by Seller). WB / Ozon / Яндекс Маркет / СберМегаМаркет.
-Версия: 4.2 (Полная совместимость с NumPy 2.0+, Pandas 2.0+, импорт/экспорт CSV).
+Версия: 4.3 (Полная совместимость с NumPy 2.0+, Pandas 2.0+,
+            импорт/экспорт CSV, расширенный экспорт с расчётами и методологией).
 """
 from __future__ import annotations
 import json, warnings, re
@@ -90,7 +91,6 @@ def fetch_deepseek_tariffs(api_key, marketplace):
         r.raise_for_status()
         raw_content = r.json()["choices"][0]["message"]["content"]
         
-        # Надежная очистка от markdown-оберток с учетом отступов и переносов строк
         clean_content = re.sub(r'^\s*```(?:json)?\s*|\s*```\s*$', '', raw_content, flags=re.IGNORECASE | re.DOTALL).strip()
         
         data = json.loads(clean_content)
@@ -154,7 +154,6 @@ def generate_auto_parts_products(n, seed=42):
     sales_30d = np.maximum(0, np.round(avg*30 + rng.standard_normal(n)*std*5)).astype(np.int64)
     return_rate = np.clip(rng.normal(loc=0.08, scale=0.04, size=n), 0.01, 0.25)
     
-    # Векторизованная генерация массивов + безопасная сборка строк (совместимо с NumPy 2.0+)
     part_names = [rng.choice(AUTO_PARTS_TYPES[str(c)]) for c in cat]
     part_brands = rng.choice(BRANDS, size=n)
     oe_numbers = rng.integers(100000, 999999, size=n)
@@ -201,7 +200,6 @@ def rule_advice(row):
     margin = float(row.get("margin_pct", 0) or 0)
     cover = row.get("cover_days")
     
-    # Безопасная обработка NaN
     cv_raw = row.get("cv", 0)
     cv = float(cv_raw) if not pd.isna(cv_raw) else 0.0
     
@@ -241,7 +239,7 @@ with st.sidebar:
     st.markdown("---"); st.markdown("**Источники тарифов:**")
     for mp in MARKETPLACES:
         st.markdown(f"{mp}: {src_badge_html(st.session_state.tariff_sources.get(mp,'default'))}", unsafe_allow_html=True)
-    st.markdown("---"); st.caption(f"© {datetime.now().year} FBS AutoParts v4.2")
+    st.markdown("---"); st.caption(f"© {datetime.now().year} FBS AutoParts v4.3")
 
 # Глобальный расчет и фильтрация
 ECO = compute_economics(st.session_state.products_df, st.session_state.tariffs_df)
@@ -287,7 +285,6 @@ if page == "🏠 Дашборд":
 elif page == "📦 Товары и остатки":
     st.markdown('<div class="main-header">📦 Управление FBS-остатками (Автозапчасти)</div>', unsafe_allow_html=True)
     
-    # Импорт данных
     st.markdown("#### 📥 Импорт данных")
     uploaded_file = st.file_uploader("Загрузить CSV с товарами (обязательные колонки: sku, name, marketplace, category, price, cost_price, weight_kg, fbs_available, sales_30d, return_rate)", type=["csv"])
     if uploaded_file is not None:
@@ -302,7 +299,7 @@ elif page == "📦 Товары и остатки":
                 
                 st.session_state.products_df = temp_df
                 st.session_state.n_products = len(temp_df)
-                compute_economics.clear() # Принудительный сброс кэша
+                compute_economics.clear()
                 st.success(f"Успешно загружено {len(temp_df):,} SKU. Экономика пересчитана.")
         except Exception as e:
             st.error(f"Ошибка чтения файла: {e}")
@@ -392,20 +389,140 @@ elif page == "📊 ABC/XYZ":
     
     st.markdown("---")
     st.markdown("**Специфика автозапчастей:** AX/BX — ходовые расходники (фильтры, колодки), держать макс. запас. CZ — неликвид (редкие кузовные детали), только под заказ или FBO.")
-  
+
 elif page == "📈 Отчёты P&L":
     st.markdown('<div class="main-header">📈 Финансовый отчёт (P&L)</div>', unsafe_allow_html=True)
     
-    # Экспорт данных
-    st.markdown("#### 📤 Экспорт расчетов")
-    csv_data = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button(
-        label="📥 Скачать полную юнит-экономику по SKU (CSV)",
-        data=csv_data,
-        file_name=f"unit_economics_{datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
+    st.markdown("#### 📤 Экспорт расчетов с методологией")
+    
+    export_cols = [
+        "sku", "name", "marketplace", "category", "price", "cost_price", "weight_kg",
+        "sales_30d", "return_rate", "fbs_available",
+        "commission_pct", "commission_amount",
+        "logistics_per_kg", "logistics_cost",
+        "return_cost",
+        "packaging_cost",
+        "storage_cost_per_unit", "storage_monthly",
+        "profit", "margin_pct",
+        "cv", "cover_days"
+    ]
+    
+    available_cols = [col for col in export_cols if col in df.columns]
+    csv_data = df[available_cols].to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    
+    methodology_text = """МЕТОДОЛОГИЯ РАСЧЕТА ЮНИТ-ЭКОНОМИКИ (FBS AutoParts Manager v4.3)
+================================================================
+
+1. ОСНОВНЫЕ ФОРМУЛЫ
+-------------------
+
+КОМИССИЯ МАРКЕТПЛЕЙСА:
+  commission_amount = price × (commission_pct / 100)
+
+ЛОГИСТИКА (FBS):
+  logistics_cost = logistics_per_kg × weight_kg
+
+ПОТЕРИ НА ВОЗВРАТАХ:
+  return_cost = logistics_cost × return_rate × 0.8
+  Пояснение: 80% логистики теряется при возврате (обратная логистика).
+
+УПАКОВКА:
+  packaging_cost — фиксированная стоимость упаковки за единицу.
+
+ХРАНЕНИЕ (ежемесячно):
+  storage_monthly = fbs_available × storage_cost_per_unit
+
+ИТОГОВАЯ ПРИБЫЛЬ С ЕДИНИЦЫ:
+  profit = price - cost_price - commission_amount - logistics_cost
+           - packaging_cost - return_cost
+
+РЕНТАБЕЛЬНОСТЬ (МАРЖА):
+  margin_pct = (profit / price) × 100
+
+ВЫРУЧКА ЗА 30 ДНЕЙ:
+  revenue = price × sales_30d
+
+2. АНАЛИТИЧЕСКИЕ МЕТРИКИ
+------------------------
+
+КОЭФФИЦИЕНТ ВАРИАЦИИ (CV):
+  cv = std_daily_sales / avg_daily_sales
+  - CV ≤ 0.15 → X (стабильный спрос)
+  - 0.15 < CV ≤ 0.35 → Y (умеренно нестабильный)
+  - CV > 0.35 → Z (высокая волатильность)
+
+ПОКРЫТИЕ В ДНЯХ:
+  cover_days = fbs_available / avg_daily_sales
+  - < 14 дней → критический остаток
+  - 14-90 дней → оптимальный запас
+  - > 90 дней → затоваривание
+
+3. СПЕЦИФИКА АВТОЗАПЧАСТЕЙ
+--------------------------
+
+ВЫСОКИЙ ПРОЦЕНТ ВОЗВРАТОВ:
+  - Типичный диапазон: 8-25% (причина — VIN-несовместимость)
+  - Рекомендация: проверять описание на наличие VIN-совместимости
+
+ВЕСОГАБАРИТНЫЕ ХАРАКТЕРИСТИКИ:
+  - Логистика рассчитывается от реального веса
+  - Типичный вес: 0.1 - 50 кг
+
+НИЗКАЯ ЭЛАСТИЧНОСТЬ СПРОСА:
+  - Снижение цены на 10% дает рост спроса лишь на 5-8%
+  - Рекомендация: удерживать маржу >20%
+
+4. ABC/XYZ АНАЛИЗ
+-----------------
+
+ABC (по доле в выручке):
+  - A (0-80%) — локомотивы
+  - B (80-95%) — стабильные продажи
+  - C (95-100%) — неликвид
+
+XYZ (по стабильности спроса):
+  - X (CV ≤ 0.15) — предсказуемый
+  - Y (0.15 < CV ≤ 0.35) — сезонные колебания
+  - Z (CV > 0.35) — хаотичный
+
+РЕКОМЕНДАЦИИ:
+  - AX/BX — макс. запас
+  - AY/BY — подстраивать под сезон
+  - CZ — только под заказ или FBO
+
+5. ИСТОЧНИКИ ДАННЫХ
+-------------------
+
+ТАРИФЫ:
+  - default — оценочные тарифы
+  - deepseek — прогноз от LLM DeepSeek
+  - api — реальные данные из API маркетплейсов
+
+================================================================
+FBS AutoParts Manager v4.3 · © 2026
+"""
+    
+    col_exp1, col_exp2 = st.columns(2)
+    with col_exp1:
+        st.download_button(
+            label="📥 Скачать юнит-экономику с расчетами (CSV)",
+            data=csv_data,
+            file_name=f"unit_economics_detailed_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+        st.caption("Включает: комиссию, логистику, возвраты, хранение, CV, покрытие")
+    
+    with col_exp2:
+        st.download_button(
+            label="📄 Скачать методологию расчетов (TXT)",
+            data=methodology_text.encode("utf-8"),
+            file_name="methodology_unit_economics.txt",
+            mime="text/plain",
+            use_container_width=True
+        )
+        st.caption("Полное описание формул и специфики автозапчастей")
+    
     st.markdown("---")
 
     d = df.copy()
@@ -469,4 +586,4 @@ elif page == "⚙️ Настройки":
         st.success("Готово."); st.rerun()
 
 st.markdown("---")
-st.caption("🚗 FBS AutoParts Manager v4.2 · кэширование · учет веса и возвратов · 500 000+ SKU")
+st.caption("🚗 FBS AutoParts Manager v4.3 · кэширование · учет веса и возвратов · 500 000+ SKU · экспорт с методологией")
