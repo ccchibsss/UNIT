@@ -2,12 +2,7 @@
 Marketplace Manager (FBS Edition) — Монолитное приложение Streamlit.
 Адаптация: Автозапчасти.
 Модель: FBS (Fulfillment by Seller). WB / Ozon / Яндекс Маркет / СберМегаМаркет.
-
-Исправления v4.1:
-  1. Удален np.core.defchararray (несовместим с NumPy 2.0+).
-  2. Усилен Regex для очистки markdown-ответов LLM.
-  3. Исправлена обработка NaN в правилах и агрегации P&L.
-  4. Оптимизирована генерация строк (истинная векторизация массивов + zip).
+Версия: 4.2 (Полная совместимость с NumPy 2.0+, Pandas 2.0+, импорт/экспорт CSV).
 """
 from __future__ import annotations
 import json, warnings, re
@@ -95,7 +90,7 @@ def fetch_deepseek_tariffs(api_key, marketplace):
         r.raise_for_status()
         raw_content = r.json()["choices"][0]["message"]["content"]
         
-        # ИСПРАВЛЕНИЕ: Надежная очистка от markdown-оберток с учетом отступов и переносов строк
+        # Надежная очистка от markdown-оберток с учетом отступов и переносов строк
         clean_content = re.sub(r'^\s*```(?:json)?\s*|\s*```\s*$', '', raw_content, flags=re.IGNORECASE | re.DOTALL).strip()
         
         data = json.loads(clean_content)
@@ -159,7 +154,7 @@ def generate_auto_parts_products(n, seed=42):
     sales_30d = np.maximum(0, np.round(avg*30 + rng.standard_normal(n)*std*5)).astype(np.int64)
     return_rate = np.clip(rng.normal(loc=0.08, scale=0.04, size=n), 0.01, 0.25)
     
-    # ИСПРАВЛЕНИЕ: Векторизованная генерация массивов + безопасная сборка строк (совместимо с NumPy 2.0+)
+    # Векторизованная генерация массивов + безопасная сборка строк (совместимо с NumPy 2.0+)
     part_names = [rng.choice(AUTO_PARTS_TYPES[str(c)]) for c in cat]
     part_brands = rng.choice(BRANDS, size=n)
     oe_numbers = rng.integers(100000, 999999, size=n)
@@ -206,7 +201,7 @@ def rule_advice(row):
     margin = float(row.get("margin_pct", 0) or 0)
     cover = row.get("cover_days")
     
-    # ИСПРАВЛЕНИЕ: Безопасная обработка NaN для cv и return_rate
+    # Безопасная обработка NaN
     cv_raw = row.get("cv", 0)
     cv = float(cv_raw) if not pd.isna(cv_raw) else 0.0
     
@@ -246,8 +241,9 @@ with st.sidebar:
     st.markdown("---"); st.markdown("**Источники тарифов:**")
     for mp in MARKETPLACES:
         st.markdown(f"{mp}: {src_badge_html(st.session_state.tariff_sources.get(mp,'default'))}", unsafe_allow_html=True)
-    st.markdown("---"); st.caption(f"© {datetime.now().year} FBS AutoParts v4.1")
+    st.markdown("---"); st.caption(f"© {datetime.now().year} FBS AutoParts v4.2")
 
+# Глобальный расчет и фильтрация
 ECO = compute_economics(st.session_state.products_df, st.session_state.tariffs_df)
 df = ECO
 if sel_mp: df = df[df["marketplace"].isin(sel_mp)]
@@ -255,6 +251,7 @@ if sel_cat: df = df[df["category"].isin(sel_cat)]
 critical = st.session_state.critical_stock
 all_default = all(st.session_state.tariff_sources.get(mp) == "default" for mp in MARKETPLACES)
 
+# ----------------------------- СТРАНИЦЫ -----------------------------
 if page == "🏠 Дашборд":
     if all_default:
         st.warning("⚠️ **Демо-тарифы.** Подключите API-ключи или DeepSeek в ⚙️ Настройках для актуальных данных.")
@@ -289,7 +286,30 @@ if page == "🏠 Дашборд":
 
 elif page == "📦 Товары и остатки":
     st.markdown('<div class="main-header">📦 Управление FBS-остатками (Автозапчасти)</div>', unsafe_allow_html=True)
+    
+    # Импорт данных
+    st.markdown("#### 📥 Импорт данных")
+    uploaded_file = st.file_uploader("Загрузить CSV с товарами (обязательные колонки: sku, name, marketplace, category, price, cost_price, weight_kg, fbs_available, sales_30d, return_rate)", type=["csv"])
+    if uploaded_file is not None:
+        try:
+            temp_df = pd.read_csv(uploaded_file)
+            required_cols = {"sku", "price", "cost_price", "weight_kg", "fbs_available", "sales_30d", "return_rate", "marketplace", "category"}
+            if not required_cols.issubset(temp_df.columns):
+                st.error(f"Ошибка структуры CSV. Отсутствуют колонки: {required_cols - set(temp_df.columns)}")
+            else:
+                temp_df["return_rate"] = temp_df["return_rate"].astype(float)
+                temp_df["sales_30d"] = temp_df["sales_30d"].astype(int)
+                
+                st.session_state.products_df = temp_df
+                st.session_state.n_products = len(temp_df)
+                compute_economics.clear() # Принудительный сброс кэша
+                st.success(f"Успешно загружено {len(temp_df):,} SKU. Экономика пересчитана.")
+        except Exception as e:
+            st.error(f"Ошибка чтения файла: {e}")
+
+    st.markdown("---")
     st.caption(f"В выборке **{len(df):,} SKU** (всего {len(ECO):,})".replace(",", " "))
+    
     view = df[["sku","name","marketplace","category","price","cost_price","weight_kg","fbs_available","sales_30d","return_rate","profit","margin_pct","status"]].copy()
     view["Цена"] = view["price"].map(fmt_rub); view["Прибыль/ед"] = view["profit"].map(fmt_rub)
     view["Маржа %"] = view["margin_pct"].round(1); view["Возвраты %"] = (view["return_rate"]*100).round(1).astype(str)+"%"
@@ -344,11 +364,8 @@ elif page == "💰 Ценообразование":
     
     m = st.columns(3)
     m[0].metric("Текущая прибыль", fmt_rub(old_prof))
-    
-    # ИСПРАВЛЕНИЕ: Защита от деления на ноль при old_rev == 0
     rev_delta = f"{(new_rev/old_rev-1)*100:+.1f}%" if old_rev > 0 else "0%"
     prof_delta = f"{(new_prof/old_prof-1)*100:+.1f}%" if old_prof > 0 else "0%"
-    
     m[1].metric("Прогноз выручки", fmt_rub(new_rev), delta=rev_delta)
     m[2].metric("Прогноз прибыли", fmt_rub(new_prof), delta=prof_delta, delta_color="normal" if new_prof>=old_prof else "inverse")
     
@@ -378,6 +395,19 @@ elif page == "📊 ABC/XYZ":
   
 elif page == "📈 Отчёты P&L":
     st.markdown('<div class="main-header">📈 Финансовый отчёт (P&L)</div>', unsafe_allow_html=True)
+    
+    # Экспорт данных
+    st.markdown("#### 📤 Экспорт расчетов")
+    csv_data = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button(
+        label="📥 Скачать полную юнит-экономику по SKU (CSV)",
+        data=csv_data,
+        file_name=f"unit_economics_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+    st.markdown("---")
+
     d = df.copy()
     d["_cogs"]=d["cost_price"]*d["sales_30d"]
     d["_comm"]=d["price"]*d["commission_pct"]/100*d["sales_30d"]
@@ -394,7 +424,6 @@ elif page == "📈 Отчёты P&L":
     tot["Валовая прибыль"] = tot["Выручка"] - tot[["Себестоимость","Комиссия","Логистика","Потери_возвраты","Упаковка","Хранение"]].sum()
     tot["Маржа %"] = round(tot["Валовая прибыль"]/tot["Выручка"]*100, 1) if tot["Выручка"] else 0.0
     
-    # ИСПРАВЛЕНИЕ: Безопасное добавление строки "ИТОГО" через concat
     tot.name = "ИТОГО"
     pl = pd.concat([pl, tot.to_frame().T])
     
@@ -440,4 +469,4 @@ elif page == "⚙️ Настройки":
         st.success("Готово."); st.rerun()
 
 st.markdown("---")
-st.caption("🚗 FBS AutoParts Manager v4.1 · кэширование · учет веса и возвратов · 500 000+ SKU")
+st.caption("🚗 FBS AutoParts Manager v4.2 · кэширование · учет веса и возвратов · 500 000+ SKU")
