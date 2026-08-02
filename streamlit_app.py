@@ -373,12 +373,16 @@ elif page == "📊 ABC/XYZ":
     L,R = st.columns(2)
     with L:
         cnt = a["abc"].value_counts().reindex(["A","B","C"], fill_value=0)
-        fig = px.pie(names=cnt.index, values=cnt.values, color=cnt.index, color_discrete_map=ABC_COLORS, title="ABC"); fig.update_layout(height=320); st.plotly_chart(fig, use_container_width=True)
+        fig = px.pie(names=cnt.index, values=cnt.values, color=cnt.index, color_discrete_map=ABC_COLORS, title="ABC")
+        fig.update_layout(height=320); st.plotly_chart(fig, use_container_width=True)
     with R:
         cnt = a["xyz"].value_counts().reindex(["X","Y","Z"], fill_value=0)
-        fig = px.pie(names=cnt.index, values=cnt.values, color=cnt.index, color_discrete_map=XYZ_COLORS, title="XYZ"); fig.update_layout(height=320); st.plotly_chart(fig, use_container_width=True)
-    st.markdown("**Специфика автозапчастей:** AX/BX — ходовые расходники (фильтры, колодки), держать макс. запас. CZ — неликвид (редкие кузовные детали), только под заказ или FBO.)
-
+        fig = px.pie(names=cnt.index, values=cnt.values, color=cnt.index, color_discrete_map=XYZ_COLORS, title="XYZ")
+        fig.update_layout(height=320); st.plotly_chart(fig, use_container_width=True)
+    
+    st.markdown("---")
+    st.markdown("**Специфика автозапчастей:** AX/BX — ходовые расходники (фильтры, колодки), держать макс. запас. CZ — неликвид (редкие кузовные детали), только под заказ или FBO.")
+  
 elif page == "📈 Отчёты P&L":
     st.markdown('<div class="main-header">📈 Финансовый отчёт (P&L)</div>', unsafe_allow_html=True)
     d = df.copy()
